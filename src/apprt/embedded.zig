@@ -343,6 +343,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    windows: Windows,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -356,6 +357,13 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    // As with the Darwin platforms, this is void when not building for
+    // Windows so the union carries no platform-specific weight elsewhere.
+    pub const Windows = if (builtin.target.os.tag == .windows) struct {
+        /// The window to render into.
+        hwnd: std.os.windows.HANDLE,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -365,6 +373,10 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        windows: extern struct {
+            hwnd: ?*anyopaque,
         },
     };
 
@@ -385,9 +397,45 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .windows => if (Windows != void) windows: {
+                const config = c_platform.windows;
+                const hwnd = config.hwnd orelse break :windows error.HwndMustBeSet;
+                break :windows .{ .windows = .{ .hwnd = @ptrCast(hwnd) } };
+            } else error.UnsupportedPlatform,
         };
     }
 };
+
+test "Platform.C layout matches the C ABI" {
+    const testing = std.testing;
+
+    // The tag values are the contract with ghostty_platform_e; a renumbering
+    // would misroute every surface without failing to compile.
+    try testing.expectEqual(@as(c_int, 1), @intFromEnum(PlatformTag.macos));
+    try testing.expectEqual(@as(c_int, 2), @intFromEnum(PlatformTag.ios));
+    try testing.expectEqual(@as(c_int, 3), @intFromEnum(PlatformTag.windows));
+
+    // Each arm is a single pointer, so the union is pointer-sized and
+    // pointer-aligned on every target. This is what makes the C union's size
+    // independent of which platform we are building for.
+    try testing.expectEqual(@sizeOf(?*anyopaque), @sizeOf(Platform.C));
+    try testing.expectEqual(@alignOf(?*anyopaque), @alignOf(Platform.C));
+
+    inline for (.{ "macos", "ios", "windows" }) |arm| {
+        const Arm = @FieldType(Platform.C, arm);
+        try testing.expectEqual(@as(usize, 0), @offsetOf(Arm, @typeInfo(Arm).@"struct".fields[0].name));
+        try testing.expectEqual(@sizeOf(?*anyopaque), @sizeOf(Arm));
+    }
+}
+
+test "a Windows platform requires a window handle" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expectError(
+        error.HwndMustBeSet,
+        Platform.init(@intFromEnum(PlatformTag.windows), .{ .windows = .{ .hwnd = null } }),
+    );
+}
 
 pub const PlatformTag = enum(c_int) {
     // "0" is reserved for invalid so we can detect unset values
@@ -395,6 +443,7 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    windows = 3,
 };
 
 pub const EnvVar = extern struct {
@@ -424,7 +473,12 @@ pub const Surface = struct {
         /// The platform that this surface is being initialized for and
         /// the associated platform-specific configuration.
         platform_tag: c_int = 0,
-        platform: Platform.C = undefined,
+        // Zeroed rather than undefined. This is an extern union of optional
+        // pointers reachable from the public constructor, so its inactive
+        // storage must be deterministic: a C caller must never observe
+        // indeterminate bytes, and a missing pointer must read as null rather
+        // than as whatever the stack held.
+        platform: Platform.C = std.mem.zeroes(Platform.C),
 
         /// Userdata passed to some of the callbacks.
         userdata: ?*anyopaque = null,

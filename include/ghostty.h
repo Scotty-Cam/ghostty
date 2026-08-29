@@ -38,6 +38,7 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID,
   GHOSTTY_PLATFORM_MACOS,
   GHOSTTY_PLATFORM_IOS,
+  GHOSTTY_PLATFORM_WINDOWS,
 } ghostty_platform_e;
 
 typedef enum {
@@ -426,9 +427,20 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
+typedef struct {
+  // The window to render into. Must be non-NULL.
+  //
+  // Only this mode is defined. Other hosting shapes - a composition panel, or
+  // an offscreen texture shared with the caller - need a renderer to define
+  // their ownership, format and synchronisation rules, and none exists yet.
+  // Adding one later is an additive change to this struct.
+  void* hwnd;
+} ghostty_platform_windows_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+  ghostty_platform_windows_s windows;
 } ghostty_platform_u;
 
 typedef enum {

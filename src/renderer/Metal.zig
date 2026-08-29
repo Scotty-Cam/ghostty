@@ -99,6 +99,12 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
             .view = switch (opts.rt_surface.platform) {
                 .macos => |v| v.nsview,
                 .ios => |v| v.uiview,
+
+                // Metal is only built for Darwin, where the Windows arm is
+                // void and cannot be constructed. Handled explicitly so that
+                // adding a platform is a compile error here rather than
+                // silently falling through.
+                .windows => unreachable,
             },
         },
 
