@@ -128,6 +128,99 @@ pub export fn ghostty_cli_try_action() void {
 }
 
 /// Return metadata about Ghostty, such as version, build mode, etc.
+/// The ABI this build of libghostty presents to Casprr, and what it was compiled with.
+///
+/// Casprr loads this library at run time and cannot rebuild it, so it needs two facts before
+/// it calls anything: whether the interface is one it understands, and which optional
+/// subsystems are actually present. Neither is answerable from the release string -- a
+/// version number describes a source tree, not a build, and two builds of the same tag can
+/// differ in renderer and app runtime.
+///
+/// Inferring either from symbol presence is the mistake this replaces. `ghostty_surface_new`
+/// exists whatever renderer was compiled in, so a consumer that reads the export table
+/// concludes the capability is there and calls into a subsystem that is not.
+///
+/// Bumped when the meaning of an existing entry point or capability bit changes. A purely
+/// additive change -- a new bit, a new entry point -- does not bump it, because a consumer
+/// that does not know about an addition is unharmed by it.
+pub const CASPRR_CORE_ABI: u32 = 1;
+
+/// Capability bits. The ABI version above defines what these mean; a consumer must compare
+/// the version before reading them, or it is interpreting a bitfield by guesswork.
+pub const CasprrCapability = struct {
+    pub const renderer_opengl: u64 = 1 << 0;
+    pub const renderer_metal: u64 = 1 << 1;
+    pub const renderer_webgl: u64 = 1 << 2;
+    pub const apprt_embedded: u64 = 1 << 8;
+    pub const apprt_gtk: u64 = 1 << 9;
+    pub const apprt_none: u64 = 1 << 10;
+    pub const platform_windows: u64 = 1 << 16;
+    pub const platform_macos: u64 = 1 << 17;
+    pub const font_freetype: u64 = 1 << 24;
+    pub const font_coretext: u64 = 1 << 25;
+    /// Set when the build carries the Windows platform arm of the embedded app runtime --
+    /// Casprr's own patch. A core without it cannot host a surface on an HWND, and that is a
+    /// different fact from the process running on Windows.
+    pub const platform_arm_windows: u64 = 1 << 18;
+};
+
+pub export fn casprr_core_abi_version() callconv(.c) u32 {
+    return CASPRR_CORE_ABI;
+}
+
+/// What this build actually compiled, read from the build configuration rather than from the
+/// target or from what happens to be exported.
+pub export fn casprr_core_capabilities() callconv(.c) u64 {
+    var bits: u64 = 0;
+
+    // Matched on the tag *name*, not by switch prong.
+    //
+    // These enums belong to upstream, and a carried patch has to compile at two points at once:
+    // the pin it was written against, and whatever upstream looks like at the next sync. An
+    // exhaustive switch breaks when upstream adds an arm; an `else` prong is a compile error at
+    // the pin, where the switch is already exhaustive. Zig will not accept both, so neither
+    // form can be carried -- which the first two versions of this patch discovered one replay
+    // at a time.
+    //
+    // Comparing names compiles whatever arms exist. An arm we do not recognise contributes no
+    // bit rather than being guessed at, and a consumer reads the capability as absent, which is
+    // the truthful answer: we do not know what this build has.
+    const rt = @tagName(build_config.app_runtime);
+    if (std.mem.eql(u8, rt, "none")) {
+        bits |= CasprrCapability.apprt_none | CasprrCapability.apprt_embedded;
+    } else if (std.mem.eql(u8, rt, "gtk")) {
+        bits |= CasprrCapability.apprt_gtk;
+    }
+
+    const rend = @tagName(build_config.renderer);
+    if (std.mem.eql(u8, rend, "opengl")) {
+        bits |= CasprrCapability.renderer_opengl;
+    } else if (std.mem.eql(u8, rend, "metal")) {
+        bits |= CasprrCapability.renderer_metal;
+    } else if (std.mem.eql(u8, rend, "webgl")) {
+        bits |= CasprrCapability.renderer_webgl;
+    }
+
+    const fb = @tagName(build_config.font_backend);
+    if (std.mem.startsWith(u8, fb, "coretext")) {
+        bits |= CasprrCapability.font_coretext;
+    } else if (std.mem.indexOf(u8, fb, "freetype") != null) {
+        bits |= CasprrCapability.font_freetype;
+    }
+
+    if (builtin.target.os.tag == .windows) {
+        bits |= CasprrCapability.platform_windows;
+        // The arm exists in this source tree, so a build for Windows carries it. Reported
+        // separately from the target because the two can diverge: a future core could target
+        // Windows without the arm, and Casprr must be able to tell.
+        if (@hasField(apprt.embedded.Platform.C, "windows")) {
+            bits |= CasprrCapability.platform_arm_windows;
+        }
+    }
+    if (builtin.target.os.tag.isDarwin()) bits |= CasprrCapability.platform_macos;
+    return bits;
+}
+
 pub export fn ghostty_info() Info {
     return .{
         .mode = switch (builtin.mode) {

@@ -1183,6 +1183,25 @@ void ghostty_set_window_background_blur(ghostty_app_t, void*);
 // Benchmark API, if available.
 bool ghostty_benchmark_cli(const char*, const char*);
 
+// Casprr additions.
+//
+// Placed at the end, after everything upstream declares, and not beside the call they most
+// resemble. The first version of this patch put them next to ghostty_info, which reads better
+// and cost a rebase conflict on the very first replay: that line is in a block upstream edits.
+// A patch series is carried for the life of the fork, so where a hunk sits is part of its cost.
+//
+// The ABI this build presents, and what it was compiled with. The release string in
+// ghostty_info_s answers neither question: a version names a source tree, not a build, and two
+// builds of the same tag differ in renderer and app runtime. Nor does the export table --
+// ghostty_surface_new is exported whatever renderer was compiled in, so its presence proves
+// nothing about what is behind it.
+//
+// The ABI version is compared exactly and defines what the capability bits mean, so it must be
+// checked before they are read. Additive changes do not bump it, because a consumer unaware of
+// an addition is unharmed by it.
+uint32_t casprr_core_abi_version(void);
+uint64_t casprr_core_capabilities(void);
+
 #ifdef __cplusplus
 }
 #endif
