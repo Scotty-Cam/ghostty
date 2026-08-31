@@ -251,8 +251,19 @@ pub fn focusGained(
         // only do this if it isn't already running. We use the termios
         // callback because that'll trigger an immediate state check AND
         // start the timer.
-        if (execdata.termios_timer_c.state() != .active) {
-            _ = termiosTimer(td, undefined, undefined, {});
+        //
+        // Guarded for Windows, like the initial `run` in threadEnter is. The timer is never
+        // started there, so `state()` is never `.active`, so this branch is always taken on
+        // Windows -- and `termiosTimer` panics on the platform it is not implemented for. Its
+        // own comment says "this should never happen because we guard starting our timer on
+        // windows", and that guard covers the scheduling path but not this one.
+        //
+        // Reached the first time a surface takes focus, which is the first thing any window
+        // does, so on Windows this is unconditional rather than a corner.
+        if (comptime builtin.os.tag != .windows) {
+            if (execdata.termios_timer_c.state() != .active) {
+                _ = termiosTimer(td, undefined, undefined, {});
+            }
         }
     }
 }
