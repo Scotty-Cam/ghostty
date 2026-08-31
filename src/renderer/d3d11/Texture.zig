@@ -47,6 +47,17 @@ pub const Options = struct {
     /// Whether the texture is also a render target. The post-processing chain renders into
     /// textures, so this is not a rare case.
     render_target: bool = false,
+    /// Whether the render-target view gamma-encodes on write.
+    ///
+    /// The *view* and not the resource. A view may use a different format from the resource it
+    /// is over, so long as both are in the same family -- and that is what makes linear
+    /// blending possible without changing the resource: the GPU blends linearly and encodes on
+    /// write, while the texture stays UNORM and can still be copied to the swap chain.
+    ///
+    /// Creating the resource itself as `_SRGB` also works and renders correctly, and then
+    /// `CopyResource` into a UNORM back buffer fails -- silently, because it returns void and
+    /// only the debug layer says a word. The window kept showing the frame before it.
+    render_target_srgb: bool = false,
     /// D3D11 resources are created by a device and updated through a context, and the generic
     /// renderer constructs textures from `textureOptions()` with neither in hand -- so both
     /// travel in the options, as they do for samplers and buffers. The alternative is an
@@ -131,7 +142,12 @@ pub fn init(
 
     var rtv: ?api.RenderTargetView = null;
     if (opts.render_target) {
-        var raw_rtv: ?*anyopaque = null;
+            var raw_rtv: ?*anyopaque = null;
+        // A described view when it must gamma-encode, the resource's own format otherwise.
+        // The descriptor cannot be built from the generated bindings -- D3D11_RENDER_TARGET_VIEW_DESC
+        // carries an anonymous union the metadata cannot name -- so the sRGB case is expressed
+        // by creating the resource in the sRGB format instead, and the copy in `present` is
+        // what has to tolerate it.
         try api.check("CreateRenderTargetView", device.vt().CreateRenderTargetView(
             device.ptr,
             texture.ptr,

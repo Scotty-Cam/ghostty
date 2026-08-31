@@ -48,6 +48,9 @@ blending: configpkg.Config.AlphaBlending,
 device: d3d11.Device,
 /// The most recently presented target, so a frame can be presented again without redrawing.
 last_target: ?Target = null,
+/// Drives frames. See `loopEnter`.
+frame_thread: ?std.Thread = null,
+frame_stop: std.atomic.Value(bool) = .init(false),
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     const hwnd: ?*anyopaque = switch (apprt.runtime) {
@@ -77,14 +80,37 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         @tagName(device.driver), device.feature_level,
     });
 
+    // Native blending, whatever the configuration asks for, until `present` can blit.
+    //
+    // Linear blending needs the render target to gamma-encode on write, which means an sRGB
+    // format. `present` copies the target into the back buffer with CopyResource, which
+    // requires identical formats, and a flip-model swap chain cannot be sRGB -- the model
+    // permits only R8G8B8A8_UNORM, B8G8R8A8_UNORM and R16G16B16A16_FLOAT. An sRGB *view* over
+    // a UNORM resource would resolve it, and the view descriptor cannot be built from the
+    // generated bindings: D3D11_RENDER_TARGET_VIEW_DESC carries one of the anonymous unions
+    // the metadata gives no usable name.
+    //
+    // So the target stays UNORM and the shaders are told not to assume linear blending, which
+    // is what `native` means. Rendering is correct; it is gamma-incorrect blending, which is
+    // what most terminals do and what this one did before ADR-002.
+    //
+    // The real fix is for `present` to draw the target through a shader rather than copy it,
+    // which also removes the size and format constraints. Recorded as a gap rather than left
+    // as a surprise: with the target sRGB and the copy failing, the window kept displaying the
+    // frame before it, and CopyResource says nothing when it refuses.
+    if (opts.config.blending.isLinear()) {
+        log.warn("linear alpha blending is not yet supported by this backend; using native", .{});
+    }
+
     return .{
         .alloc = alloc,
-        .blending = opts.config.blending,
+        .blending = .native,
         .device = device,
     };
 }
 
 pub fn deinit(self: *D3D11) void {
+    self.loopExit();
     if (self.last_target) |*t| t.deinit();
     self.device.deinit();
     self.* = undefined;
@@ -112,6 +138,54 @@ pub fn threadExit(self: *const D3D11) void {
     _ = self;
 }
 
+/// Start driving frames.
+///
+/// Nothing else does on Windows. The render thread's own draw timer only runs when a custom
+/// shader is animating, and `draw_now` -- which its comment calls "the only way to trigger a
+/// drawFrame" -- is notified from exactly one place in the whole renderer: the macOS display
+/// link callback. So a Windows surface came up, sized itself, started its render thread, and
+/// then drew nothing, forever, with no error anywhere.
+///
+/// Metal solves this in `loopEnter` by registering a display-link callback, and this is the
+/// same shape: a thread that paces frames and calls `drawFrame` on the renderer. It is the
+/// backend's job because the pacing source is the backend's -- here, the swap chain.
+pub fn loopEnter(self: *D3D11) void {
+    if (self.frame_thread != null) return;
+    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    self.frame_stop.store(false, .seq_cst);
+    self.frame_thread = std.Thread.spawn(.{}, frameLoop, .{ self, renderer }) catch |err| {
+        log.err("could not start the frame thread, nothing will draw: err={}", .{err});
+        return;
+    };
+}
+
+pub fn loopExit(self: *D3D11) void {
+    const t = self.frame_thread orelse return;
+    self.frame_stop.store(true, .seq_cst);
+    t.join();
+    self.frame_thread = null;
+}
+
+/// Ask for a frame at a steady cadence.
+///
+/// A sleep, not a wait on the swap chain's waitable object. The waitable object is the right
+/// pacing source and wants the chain created with FRAME_LATENCY_WAITABLE_OBJECT; this is the
+/// smaller first step, and `present` already refuses to submit an unchanged frame, so an
+/// unnecessary wake costs a comparison rather than a present.
+fn frameLoop(self: *D3D11, renderer: *align(1) Renderer) void {
+    // The alignment is 1 because `@fieldParentPtr` from a field of an over-aligned struct
+    // cannot promise more; `drawFrame` wants a naturally aligned pointer and the object really
+    // is aligned, so the cast states what the type system cannot infer.
+    const interval_ns: u64 = 8 * std.time.ns_per_ms; // 120 Hz, matching Thread.DRAW_INTERVAL
+    while (!self.frame_stop.load(.seq_cst)) {
+        std.Thread.sleep(interval_ns);
+        const r: *Renderer = @alignCast(renderer);
+        r.drawFrame(true) catch |err| {
+            log.warn("error drawing frame err={}", .{err});
+        };
+    }
+}
+
 pub fn drawFrameStart(self: *D3D11) void {
     _ = self;
 }
@@ -136,8 +210,8 @@ pub fn initTarget(self: *const D3D11, width: usize, height: usize) !Target {
     return Target.init(.{
         .width = width,
         .height = height,
-        // An `*_srgb` view makes the GPU gamma-encode after blending, which is what gives
-        // linear alpha blending rather than gamma-incorrect blending.
+        // Never sRGB: `present` copies this into the back buffer, and CopyResource requires
+        // identical formats. See the note in `init`.
         .srgb = self.blending.isLinear(),
         .device = self.device.device,
         .context = self.device.context,
