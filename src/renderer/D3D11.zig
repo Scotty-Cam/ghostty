@@ -50,6 +50,9 @@ device: d3d11.Device,
 last_target: ?Target = null,
 /// Drives frames. See `loopEnter`.
 frame_thread: ?std.Thread = null,
+/// Built on first present. See `blitPipeline`.
+blit: ?Pipeline = null,
+blit_sampler: ?Sampler = null,
 frame_stop: std.atomic.Value(bool) = .init(false),
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
@@ -80,37 +83,17 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         @tagName(device.driver), device.feature_level,
     });
 
-    // Native blending, whatever the configuration asks for, until `present` can blit.
-    //
-    // Linear blending needs the render target to gamma-encode on write, which means an sRGB
-    // format. `present` copies the target into the back buffer with CopyResource, which
-    // requires identical formats, and a flip-model swap chain cannot be sRGB -- the model
-    // permits only R8G8B8A8_UNORM, B8G8R8A8_UNORM and R16G16B16A16_FLOAT. An sRGB *view* over
-    // a UNORM resource would resolve it, and the view descriptor cannot be built from the
-    // generated bindings: D3D11_RENDER_TARGET_VIEW_DESC carries one of the anonymous unions
-    // the metadata gives no usable name.
-    //
-    // So the target stays UNORM and the shaders are told not to assume linear blending, which
-    // is what `native` means. Rendering is correct; it is gamma-incorrect blending, which is
-    // what most terminals do and what this one did before ADR-002.
-    //
-    // The real fix is for `present` to draw the target through a shader rather than copy it,
-    // which also removes the size and format constraints. Recorded as a gap rather than left
-    // as a surprise: with the target sRGB and the copy failing, the window kept displaying the
-    // frame before it, and CopyResource says nothing when it refuses.
-    if (opts.config.blending.isLinear()) {
-        log.warn("linear alpha blending is not yet supported by this backend; using native", .{});
-    }
-
     return .{
         .alloc = alloc,
-        .blending = .native,
+        .blending = opts.config.blending,
         .device = device,
     };
 }
 
 pub fn deinit(self: *D3D11) void {
     self.loopExit();
+    if (self.blit) |p| p.deinit();
+    if (self.blit_sampler) |smp| smp.deinit();
     if (self.last_target) |*t| t.deinit();
     self.device.deinit();
     self.* = undefined;
@@ -210,8 +193,9 @@ pub fn initTarget(self: *const D3D11, width: usize, height: usize) !Target {
     return Target.init(.{
         .width = width,
         .height = height,
-        // Never sRGB: `present` copies this into the back buffer, and CopyResource requires
-        // identical formats. See the note in `init`.
+        // An sRGB target makes the GPU gamma-encode after blending, which is what gives
+        // linear alpha blending rather than gamma-incorrect blending. `present` draws this
+        // into the back buffer rather than copying it, so the formats need not match.
         .srgb = self.blending.isLinear(),
         .device = self.device.device,
         .context = self.device.context,
@@ -225,22 +209,82 @@ pub fn initTarget(self: *const D3D11, width: usize, height: usize) !Target {
 /// to re-establish every piece of state the last pass left set.
 pub fn present(self: *D3D11, target: Target) !void {
     const ctx = self.device.context;
-    if (self.device.swap_chain) |sc| {
-        var raw_back: ?*anyopaque = null;
-        try api.check("GetBuffer", sc.vt().GetBuffer(
-            sc.ptr,
-            0,
-            @constCast(@ptrCast(&d3d11.com.IID_ID3D11Texture2D)),
-            &raw_back,
-        ));
-        if (api.Texture2D.from(raw_back)) |back| {
-            defer back.release();
-            ctx.vt().CopyResource(ctx.ptr, back.ptr, target.texture.texture.ptr);
-        }
+    if (self.device.rtv) |back_rtv| {
+        // Drawn, not copied.
+        //
+        // CopyResource requires identical formats, and the target is sRGB while a flip-model
+        // swap chain cannot be. The copy was refused, silently -- it returns void, and only the
+        // debug layer says a word -- so the window went on displaying the previous frame, which
+        // is indistinguishable from a renderer that never drew.
+        //
+        // Sampling decodes the sRGB target to linear and the write stores it back unchanged
+        // into the UNORM back buffer, which is the encoded value the target already held.
+        const pipeline = try self.blitPipeline();
+        var views = [_]?*anyopaque{back_rtv.ptr};
+        ctx.vt().OMSetRenderTargets(ctx.ptr, 1, &views[0], null);
+
+        var viewport = d3d11.com.D3D11_VIEWPORT{
+            .TopLeftX = 0,
+            .TopLeftY = 0,
+            .Width = @floatFromInt(self.device.width),
+            .Height = @floatFromInt(self.device.height),
+            .MinDepth = 0,
+            .MaxDepth = 1,
+        };
+        ctx.vt().RSSetViewports(ctx.ptr, 1, &viewport);
+        ctx.vt().IASetPrimitiveTopology(ctx.ptr, api.Topology.triangle_list);
+        ctx.vt().IASetInputLayout(ctx.ptr, null);
+        ctx.vt().VSSetShader(ctx.ptr, pipeline.vs.ptr, null, 0);
+        ctx.vt().PSSetShader(ctx.ptr, pipeline.ps.ptr, null, 0);
+
+        var srvs = [_]?*anyopaque{target.texture.srv.ptr};
+        ctx.vt().PSSetShaderResources(ctx.ptr, 0, 1, &srvs[0]);
+        var samplers = [_]?*anyopaque{(try self.blitSampler()).sampler.ptr};
+        ctx.vt().PSSetSamplers(ctx.ptr, 0, 1, &samplers[0]);
+
+        // No blending: this replaces the back buffer rather than compositing onto it.
+        var bf = [4]f32{ 0, 0, 0, 0 };
+        ctx.vt().OMSetBlendState(ctx.ptr, null, &bf[0], 0xFFFFFFFF);
+        ctx.vt().Draw(ctx.ptr, 3, 0);
+
+        // Unbound before presenting: the target is a shader input here and a render target on
+        // the next frame, and D3D11 resolves that hazard by silently dropping one of them.
+        var none = [_]?*anyopaque{null};
+        ctx.vt().PSSetShaderResources(ctx.ptr, 0, 1, &none[0]);
     }
     self.device.dirty = true;
     try self.device.present(false);
     self.last_target = target;
+}
+
+/// The pipeline `present` draws with, built on first use.
+///
+/// Lazily, because it needs the device and `init` builds that; and here rather than in the
+/// renderer's shader set because it is not one of the renderer's passes -- the generic renderer
+/// never asks for it and `present` cannot reach the shaders from the api.
+fn blitPipeline(self: *D3D11) !Pipeline {
+    if (self.blit) |p| return p;
+    const p = try Pipeline.init(null, .{
+        .source = d3d11.sources.blit,
+        .name = "blit",
+        .blending_enabled = false,
+        .device = self.device.device,
+    });
+    self.blit = p;
+    return p;
+}
+
+fn blitSampler(self: *D3D11) !Sampler {
+    if (self.blit_sampler) |s| return s;
+    const s = try Sampler.init(.{
+        // Point sampling: the target and the back buffer are the same size, so every texel
+        // maps to one pixel and filtering would only soften text.
+        .filter = .nearest,
+        .wrap = .clamp,
+        .device = self.device.device,
+    });
+    self.blit_sampler = s;
+    return s;
 }
 
 pub fn presentLastTarget(self: *D3D11) !void {

@@ -44,6 +44,9 @@ fn assemble(comptime src: []const u8, comptime with_full_screen: bool) [:0]const
 }
 
 pub const bg_color: [:0]const u8 = assemble(@embedFile("../shaders/hlsl/bg_color.hlsl"), true);
+/// Draws a render target into the back buffer. Not one of the renderer's pipelines -- it
+/// belongs to `present`, which is why it needs neither the globals nor the full-screen helper.
+pub const blit: [:0]const u8 = @embedFile("../shaders/hlsl/blit.hlsl") ++ "\x00";
 pub const cell_bg: [:0]const u8 = assemble(@embedFile("../shaders/hlsl/cell_bg.hlsl"), true);
 pub const cell_text: [:0]const u8 = assemble(@embedFile("../shaders/hlsl/cell_text.hlsl"), false);
 pub const image: [:0]const u8 = assemble(@embedFile("../shaders/hlsl/image.hlsl"), false);

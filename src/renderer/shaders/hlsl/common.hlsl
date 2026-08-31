@@ -18,7 +18,12 @@
 //     than the multiplication being flipped to compensate.
 
 cbuffer Globals : register(b0) {
-    row_major float4x4 projection_matrix;
+    // Column-major, which is HLSL's default for a constant buffer and what the matrix
+    // actually is: the core builds it for GLSL, where a mat4 in std140 is column-major.
+    // Declared `row_major` it is transposed on read, and every position the vertex stage
+    // computes lands somewhere else -- the glyph quads came out as a wedge across the window
+    // while the full-screen passes, which never touch the matrix, rendered correctly.
+    float4x4 projection_matrix;
     float2 screen_size;
     float2 cell_size;
     uint   grid_size_packed_2u16;
