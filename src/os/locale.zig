@@ -210,8 +210,28 @@ fn preferredLanguageFromCocoa(
     return slice[0 .. slice.len - 1 :0];
 }
 
-const LC_ALL: c_int = 6; // from locale.h
-const LC_ALL_MASK: c_int = 0x7fffffff; // from locale.h
+// The locale categories, from the target's own locale.h rather than transcribed.
+//
+// These are implementation-defined. They were hardcoded to glibc's values, and `LC_ALL = 6` is
+// wrong everywhere else: on Windows it is 0, so `setlocale(6, "")` is an invalid category and
+// the Universal CRT terminates the process through `__fastfail`. That is not catchable -- not
+// by an invalid-parameter handler, which the noreturn variants ignore, and not by a vectored
+// exception handler -- so it presents as a process that dies during initialisation having
+// logged nothing.
+//
+// It is wrong on macOS too, where 6 is LC_MESSAGES: those builds have been setting one
+// category while believing they set all of them.
+//
+// Upstream fixed this in f0badd34d ("replace hardcoded locale.h constants with build-system
+// TranslateC") by threading a translated header through the build. This takes the constants
+// from the same place with a `@cImport`, which is the smaller change at this pin and does the
+// same thing; the patch disappears on a rebase past that commit.
+const c = @cImport({
+    @cInclude("locale.h");
+});
+
+const LC_ALL: c_int = c.LC_ALL;
+const LC_ALL_MASK: c_int = if (@hasDecl(c, "LC_ALL_MASK")) c.LC_ALL_MASK else 0x7fffffff;
 const locale_t = ?*anyopaque;
 extern "c" fn setlocale(category: c_int, locale: ?[*]const u8) ?[*:0]u8;
 extern "c" fn newlocale(category: c_int, locale: ?[*]const u8, base: locale_t) locale_t;
