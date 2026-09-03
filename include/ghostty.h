@@ -1202,6 +1202,19 @@ bool ghostty_benchmark_cli(const char*, const char*);
 uint32_t casprr_core_abi_version(void);
 uint64_t casprr_core_capabilities(void);
 
+// Turn the core's own stderr logging on or off, returning the previous value.
+//
+// A library build starts silent: GlobalState.Logging.stderr defaults to
+// `app_runtime != .none`, which is false for every embedded build, on the
+// assumption that an embedder routes diagnostics itself. There was no way to
+// change that from C, so the core could not be asked what it was doing -- a
+// font family that cannot resolve produced no complaint at all.
+//
+// Not automatic, because a library that writes to its host's stderr merely
+// because it was loaded is badly behaved. The default is right; the switch was
+// missing.
+bool casprr_core_set_stderr_logging(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

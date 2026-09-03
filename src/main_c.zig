@@ -169,6 +169,29 @@ pub export fn casprr_core_abi_version() callconv(.c) u32 {
     return CASPRR_CORE_ABI;
 }
 
+/// Turn the core's own stderr logging on or off.
+///
+/// A library build silences it. `GlobalState.Logging.stderr` defaults to
+/// `build_config.app_runtime != .none`, so every embedded build -- which is every build Casprr
+/// ships -- starts with the core mute, on the reasonable assumption that an embedder routes
+/// diagnostics itself. Upstream exposes no way to change that from C.
+///
+/// The consequence is not small. A font family that cannot possibly resolve produced no
+/// complaint, a renderer health change produced no line, and every question about what the
+/// core thinks it is doing had to be answered by inference from the outside. Three successive
+/// hypotheses about font discovery were tested and discarded that way, and the reason they
+/// were hypotheses rather than measurements is this flag.
+///
+/// Returns the previous value, so a caller can restore it rather than assume.
+///
+/// Deliberately not automatic: a library that starts writing to a host's stderr because it was
+/// loaded is badly behaved, and the default is right. What was missing is the switch.
+pub export fn casprr_core_set_stderr_logging(enabled: bool) callconv(.c) bool {
+    const was = state.logging.stderr;
+    state.logging.stderr = enabled;
+    return was;
+}
+
 /// What this build actually compiled, read from the build configuration rather than from the
 /// target or from what happens to be exported.
 pub export fn casprr_core_capabilities() callconv(.c) u64 {
