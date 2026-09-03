@@ -69,6 +69,18 @@ frame_thread: ?std.Thread = null,
 blit: ?Pipeline = null,
 blit_sampler: ?Sampler = null,
 frame_stop: std.atomic.Value(bool) = .init(false),
+/// The window, kept because a device rebuild needs it and `init` is the only other place it
+/// was ever read.
+hwnd: ?*anyopaque = null,
+/// Whether the debug layer was asked for, so a rebuilt device is the same kind of device.
+debug_layer: bool = false,
+/// Set the first time a removal is observed, cleared by `rebuildDevice`.
+///
+/// Not `health`. Health is a reported symptom that other things also set, and it is read by
+/// code that has nothing to do with recovery; this is a record of one specific event, written
+/// once by whichever call saw it first. Atomic because the frame thread writes it and the
+/// renderer thread reads it.
+lost: std.atomic.Value(bool) = .init(false),
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     const hwnd: ?*anyopaque = switch (apprt.runtime) {
@@ -85,7 +97,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     // The debug layer is asked for in a debug build and is not required: it is an optional
     // Windows component, absent on a stock install, and requesting it on a machine without it
     // fails device creation outright. `Device.init` retries without it.
-    var device = try d3d11.Device.init(builtin.mode == .Debug);
+    const debug_layer = builtin.mode == .Debug;
+    var device = try d3d11.Device.init(debug_layer);
     errdefer device.deinit();
 
     const size = opts.rt_surface.getSize() catch |err| {
@@ -102,7 +115,67 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         .alloc = alloc,
         .blending = opts.config.blending,
         .device = device,
+        .hwnd = hwnd,
+        .debug_layer = debug_layer,
     };
+}
+
+/// Whether a device removal has been observed and not yet recovered from.
+///
+/// Read by the generic renderer at the top of `updateFrame`. Optional there by `@hasDecl`, so
+/// a backend that cannot lose its device declares nothing and is unaffected.
+pub fn deviceLost(self: *const D3D11) bool {
+    return self.lost.load(.seq_cst);
+}
+
+/// Record that the device is gone. Idempotent: the first observation is the useful one.
+///
+/// Public because the frame path observes removals too, and a cascade of failures from one
+/// dead device should not overwrite the account of which call saw it first.
+pub fn noteLoss(self: *D3D11, where: []const u8, reason: i32) void {
+    if (self.lost.swap(true, .seq_cst)) return;
+    log.err("device removed, observed by {s}: reason=0x{x:0>8}", .{
+        where, @as(u32, @bitCast(reason)),
+    });
+}
+
+/// Rebuild everything this backend owns on the device.
+///
+/// Called by the generic renderer with the draw mutex held and after it has released its own
+/// device-owned state -- the swap chain's frame states, the shaders, the image cache. This
+/// releases what the BACKEND owns and nothing else, which is the present pipeline, its sampler
+/// and the retained last target. Miss one and it survives the rebuild as a COM pointer into a
+/// dead device: not a crash, because Release still answers, but a leak the object-count oracle
+/// is there to catch.
+pub fn rebuildDevice(self: *D3D11) !void {
+    if (self.blit) |p| {
+        p.deinit();
+        self.blit = null;
+    }
+    if (self.blit_sampler) |s| {
+        s.deinit();
+        self.blit_sampler = null;
+    }
+    if (self.last_target) |*old| {
+        old.deinit();
+        self.last_target = null;
+    }
+
+    const width = self.device.width;
+    const height = self.device.height;
+    try self.device.rebuild(self.hwnd, width, height, self.debug_layer);
+    log.info("device rebuilt: {d}x{d}", .{ width, height });
+}
+
+/// Declare the recovery complete.
+///
+/// Deliberately NOT done by `rebuildDevice`. The device is only the first thing to rebuild --
+/// the shaders and the swap chain follow, on the renderer's side, and either can fail. Clearing
+/// the record when the device came back would leave a renderer with a live device and no
+/// pipelines, and nothing would ever retry, because the retry is driven by this flag. So the
+/// last step belongs to whoever performed the last step.
+pub fn clearLoss(self: *D3D11) void {
+    self.lost.store(false, .seq_cst);
 }
 
 pub fn deinit(self: *D3D11) void {
@@ -337,12 +410,7 @@ pub fn setSurfaceSize(self: *D3D11, width: u32, height: u32) !void {
         // once, attributed to the call that observed it, instead of the next frame's
         // GetDeviceRemovedReason reporting a removal with no idea what triggered it.
         const removed = self.device.device.vt().GetDeviceRemovedReason(self.device.device.ptr);
-        if (removed != api.S_OK) {
-            log.err(
-                "device removed, observed by ResizeBuffers: reason=0x{x:0>8} err={}",
-                .{ @as(u32, @bitCast(removed)), err },
-            );
-        }
+        if (removed != api.S_OK) self.noteLoss("ResizeBuffers", removed);
         return err;
     };
     // The next frame must be presented even if the terminal has not changed a cell: the back

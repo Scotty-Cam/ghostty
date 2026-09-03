@@ -983,6 +983,77 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.shaders.deinit(self.alloc);
         }
 
+        /// Rebuild every GPU resource after the device was lost, keeping the terminal.
+        ///
+        /// This is NOT `displayUnrealized` followed by `displayRealized`, and the difference is
+        /// the reason this function exists. Those two rebuild the swap chain and the shaders,
+        /// which covers every `FrameState` resource because they all live inside the swap
+        /// chain. They do not touch `api` -- and after a device removal the device itself is
+        /// gone, so rebuilding the swap chain against it recreates the same failure. They also
+        /// do not know about `images` or `bg_image`.
+        ///
+        /// Terminal state costs nothing to preserve: the grid, styles, scrollback and cursor
+        /// are CPU-side and were never on the device. The image cache costs nothing either --
+        /// it is a cache, and clearing it makes the next frame's placement walk re-upload from
+        /// the terminal's own graphics store. The background image is the one exception, since
+        /// `prepBackgroundImage` runs only from `changeConfig` and only when the configured
+        /// path changes, so nothing would reload it unprompted.
+        fn recoverDevice(self: *Self) Allocator.Error!void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
+            log.warn("graphics device lost; rebuilding GPU resources", .{});
+
+            // Order matters: everything created from the old device goes before the device
+            // does. A COM interface outliving its device still answers Release, so a missed
+            // one leaks rather than crashes -- which is why the object-count oracle exists.
+            self.swap_chain.deinit();
+            self.shaders.deinit(self.alloc);
+            self.images.deinit(self.alloc);
+            self.images = .empty;
+            if (self.bg_image) |*img| {
+                img.deinit(self.alloc);
+                self.bg_image = null;
+            }
+
+            self.api.rebuildDevice() catch |err| {
+                // Left for the next frame to retry. The backend keeps its loss recorded when
+                // the rebuild fails, so this is a retry rather than a state nobody revisits;
+                // and there is nothing else to do from here, since every path out of this
+                // function needs a device.
+                log.err("could not rebuild the graphics device err={}", .{err});
+                return;
+            };
+
+            self.initShaders() catch |err| {
+                log.err("could not rebuild the shaders err={}", .{err});
+                return;
+            };
+            self.swap_chain = SwapChain.init(self.api, self.has_custom_shaders) catch |err| {
+                log.err("could not rebuild the swap chain err={}", .{err});
+                return;
+            };
+            self.reinitialize_shaders = false;
+            self.target_config_modified = 1;
+
+            // The background image has a file behind it; nothing else reloads it.
+            self.prepBackgroundImage() catch |err| {
+                log.warn("could not reload the background image err={}", .{err});
+            };
+            self.bg_image_changed = true;
+            self.updateBgImageBuffer();
+
+            // Every cell, because the new targets contain nothing at all.
+            self.markDirty();
+
+            // Last, and only now. Every early return above leaves the backend's loss record
+            // standing, which is what makes the next frame retry rather than proceed against
+            // a half-rebuilt renderer -- a live device with no pipelines would otherwise draw
+            // nothing forever, with nothing to say why.
+            self.api.clearLoss();
+            log.info("graphics device recovered", .{});
+        }
+
         fn displayLinkCallback(
             _: *macos.video.DisplayLink,
             ud: ?*xev.Async,
@@ -1134,6 +1205,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //         .{ start_micro, end.since(start) / std.time.ns_per_us },
             //     );
             // }
+
+            // Recover from a lost graphics device before anything else this frame.
+            //
+            // Here rather than at the point of failure, and that placement is the whole
+            // design. The loss is observed in the frame path -- `Frame.complete`, or a failing
+            // `ResizeBuffers` -- and recovering there would tear down the swap chain from
+            // inside a frame whose semaphore permit has not been returned yet, so
+            // `SwapChain.deinit`'s wait can block on the very frame doing the recovering. The
+            // failure is therefore recorded and acted on at the start of the next turn of the
+            // renderer loop, by which point the permit is back.
+            //
+            // Optional by `@hasDecl`, like `displayRealized`: a backend that cannot lose its
+            // device declares neither method and this compiles to nothing.
+            if (comptime @hasDecl(GraphicsAPI, "deviceLost")) {
+                if (self.api.deviceLost()) try self.recoverDevice();
+            }
 
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause

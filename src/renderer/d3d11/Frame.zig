@@ -70,7 +70,7 @@ pub fn complete(self: *const Self, sync: bool) void {
     var health: Health = if (removed == api.S_OK) .healthy else .unhealthy;
 
     if (health == .healthy) {
-        self.renderer.api.present(self.target.*) catch |err| {
+        self.renderer.api.present(self.target.*) catch |present_err| {
             // Ask again. A present that fails on a live device is one thing -- an occluded
             // window, a transient -- and a present that fails because the adapter is gone is
             // another, and only the device can tell them apart. Deciding here on the strength
@@ -78,16 +78,19 @@ pub fn complete(self: *const Self, sync: bool) void {
             removed = self.device.vt().GetDeviceRemovedReason(self.device.ptr);
             if (removed != api.S_OK) {
                 health = .unhealthy;
-                log.err(
-                    "device removed, observed by Present: reason=0x{x:0>8} err={}",
-                    .{ @as(u32, @bitCast(removed)), err },
-                );
+                // Recorded on the API, not merely logged. `health` is a symptom other things
+                // set; the recovery path keys off this record, and it is written once by
+                // whichever call observed the loss first.
+                self.renderer.api.noteLoss("Present", removed);
             } else {
-                log.err("failed to present the render target on a live device: err={}", .{err});
+                log.err(
+                    "failed to present the render target on a live device: err={}",
+                    .{present_err},
+                );
             }
         };
     } else {
-        log.err("device removed: 0x{x:0>8}", .{@as(u32, @bitCast(removed))});
+        self.renderer.api.noteLoss("GetDeviceRemovedReason", removed);
     }
 
     self.renderer.frameCompleted(health);

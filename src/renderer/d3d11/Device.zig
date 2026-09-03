@@ -103,6 +103,38 @@ fn create(driver_type: i32, flags: u32) api.Error!Device {
     };
 }
 
+/// Rebuild the device and its swap chain after the adapter has gone.
+///
+/// Everything the old device made is invalid, including the device itself, so this is a
+/// destroy and a create rather than a repair -- `ResizeBuffers` and friends cannot bring a
+/// removed device back.
+///
+/// The caller must have released every other object created from the old device FIRST. Nothing
+/// here can check that: a COM interface from a removed device still answers `Release`, so a
+/// missed one is not a crash but a leak, and the object-count oracle is what catches it.
+///
+/// `ClearState` and `Flush` before tearing down, because D3D11 holds references from bound
+/// pipeline slots and defers destruction otherwise -- so a teardown without them frees nothing
+/// at the moment it appears to, which the same oracle would read as a leak.
+pub fn rebuild(
+    self: *Device,
+    hwnd: ?*anyopaque,
+    width: u32,
+    height: u32,
+    debug_layer: bool,
+) api.Error!void {
+    self.context.vt().ClearState(self.context.ptr);
+    self.context.vt().Flush(self.context.ptr);
+    self.deinit();
+
+    self.* = try Device.init(debug_layer);
+    errdefer self.deinit();
+    try self.attach(hwnd, width, height);
+    // The new back buffer holds nothing, so the next frame must be presented even if the
+    // terminal has not changed a cell.
+    self.dirty = true;
+}
+
 pub fn deinit(self: *Device) void {
     self.releaseTargets();
     if (self.swap_chain) |sc| sc.release();
