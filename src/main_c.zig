@@ -151,6 +151,7 @@ pub const CasprrCapability = struct {
     pub const renderer_opengl: u64 = 1 << 0;
     pub const renderer_metal: u64 = 1 << 1;
     pub const renderer_webgl: u64 = 1 << 2;
+    pub const renderer_d3d11: u64 = 1 << 3;
     pub const apprt_embedded: u64 = 1 << 8;
     pub const apprt_gtk: u64 = 1 << 9;
     pub const apprt_none: u64 = 1 << 10;
@@ -199,6 +200,8 @@ pub export fn casprr_core_capabilities() callconv(.c) u64 {
         bits |= CasprrCapability.renderer_metal;
     } else if (std.mem.eql(u8, rend, "webgl")) {
         bits |= CasprrCapability.renderer_webgl;
+    } else if (std.mem.eql(u8, rend, "d3d11")) {
+        bits |= CasprrCapability.renderer_d3d11;
     }
 
     const fb = @tagName(build_config.font_backend);
