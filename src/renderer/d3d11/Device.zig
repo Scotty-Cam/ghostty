@@ -53,8 +53,23 @@ const feature_levels = [_]u32{
 /// reported as no device -- which is what the reference machine does, and why its
 /// diagnosability is recorded as unmeasured rather than assumed.
 pub fn init(debug_layer: bool) api.Error!Device {
+    return initDriver(debug_layer, false);
+}
+
+/// Create a device, optionally forcing the software adapter.
+///
+/// `force_warp` exists for the ADR-002 software-fallback measurement: the fallback has to be
+/// exercised deliberately, not waited for. `init` is the product path and never forces it --
+/// WARP is what you get when hardware creation fails, and choosing it when hardware works
+/// would be a terminal quietly running on the software adapter.
+pub fn initDriver(debug_layer: bool, force_warp: bool) api.Error!Device {
     var flags: u32 = api.CreateFlag.bgra_support;
     if (debug_layer) flags |= api.CreateFlag.debug;
+
+    if (force_warp) {
+        log.info("WARP requested explicitly; not attempting hardware", .{});
+        if (create(api.DriverType.warp, flags)) |d| return d else |e| return e;
+    }
 
     if (create(api.DriverType.hardware, flags)) |d| return d else |_| {}
     if (debug_layer) {
