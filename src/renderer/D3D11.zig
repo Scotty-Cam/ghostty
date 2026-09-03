@@ -47,6 +47,21 @@ alloc: Allocator,
 blending: configpkg.Config.AlphaBlending,
 device: d3d11.Device,
 /// The most recently presented target, so a frame can be presented again without redrawing.
+///
+/// A RETAINED reference, not a borrowed alias, and that distinction was a live defect. A
+/// `Target` is a value type holding raw COM pointers, so `last_target = target` copied the
+/// pointers without taking references. Two things then owned the same three interfaces:
+///
+///   - At teardown, `FrameState.deinit` released them and so did `deinit` here -- a double
+///     release, which is a use-after-free on whichever ran second.
+///   - On every resize, `FrameState.resize` deinits its old target and replaces it, leaving
+///     this pointing at freed memory. `presentLastTarget` would then present it. That path
+///     is reached by dragging a window edge.
+///
+/// Retaining fixes both. After a resize this holds the old target alive and presenting it
+/// shows one stale frame rather than reading freed memory, and the next real present replaces
+/// it. A stale frame between a resize and the next draw is a cosmetic non-event; the
+/// alternative was not.
 last_target: ?Target = null,
 /// Drives frames. See `loopEnter`.
 frame_thread: ?std.Thread = null,
@@ -94,6 +109,7 @@ pub fn deinit(self: *D3D11) void {
     self.loopExit();
     if (self.blit) |p| p.deinit();
     if (self.blit_sampler) |smp| smp.deinit();
+    // Legitimate because `present` retained it. See the field's own comment.
     if (self.last_target) |*t| t.deinit();
     self.device.deinit();
     self.* = undefined;
@@ -254,6 +270,13 @@ pub fn present(self: *D3D11, target: Target) !void {
     }
     self.device.dirty = true;
     try self.device.present(false);
+
+    // Retain the new one and release the old, in that order and never the reverse: the
+    // renderer presents the same target repeatedly, so `target` and `self.last_target` are
+    // routinely the same interfaces. Releasing first would drop the last reference to a
+    // target we are about to keep.
+    target.retain();
+    if (self.last_target) |*old| old.deinit();
     self.last_target = target;
 }
 
@@ -291,12 +314,28 @@ pub fn presentLastTarget(self: *D3D11) !void {
     if (self.last_target) |target| try self.present(target);
 }
 
-/// Resize the swap chain to match the window.
+/// Tell the backend how big the surface now is.
 ///
-/// Called by the shell when the window changes size. The renderer's own targets are managed by
-/// the generic renderer; this is only the chain the frames are shown through.
-pub fn resize(self: *D3D11, width: u32, height: u32) !void {
+/// Called from `Renderer.setScreenSize`, which is where the real pixel size arrives. It was
+/// previously named `resize` and had NO CALLER anywhere in the tree: the generic renderer
+/// asks `surfaceSize()` for the authority, and ours answered with the swap chain's cached
+/// dimensions, which only this function changes. A closed loop -- the size could never change,
+/// so the renderer never resized a target, and a resized window showed a stale back buffer
+/// stretched to fit.
+///
+/// Only the chain the frames are presented through. The renderer's own targets are its
+/// business, and it rebuilds them from `surfaceSize()` on the next frame.
+pub fn setSurfaceSize(self: *D3D11, width: u32, height: u32) !void {
     try self.device.resize(width, height);
+    // The next frame must be presented even if the terminal has not changed a cell: the back
+    // buffer is new and holds nothing.
+    self.device.dirty = true;
+    // `Device.resize` released and rebuilt the back-buffer view, so a target retained from
+    // before is no longer the right size to present. Dropped rather than presented.
+    if (self.last_target) |*old| {
+        old.deinit();
+        self.last_target = null;
+    }
 }
 
 pub inline fn bufferOptions(self: D3D11) bufferpkg.Options {

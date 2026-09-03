@@ -1927,6 +1927,36 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // everything else is derived elsewhere.
             self.size.padding = size.padding;
 
+            // Except on a backend whose surface size is not self-describing.
+            //
+            // `drawFrame` treats `api.surfaceSize()` as the authority and resizes its targets
+            // to whatever it returns, which is right for a CAMetalLayer: the layer is resized
+            // by the view and simply knows. A DXGI swap chain does not. Its size is whatever
+            // `ResizeBuffers` was last told, so a backend that has never been told anything
+            // reports its creation size forever -- `surfaceSize` then never changes,
+            // `size_changed` is never true, and no target is ever resized. The window grows
+            // and DXGI stretches a stale back buffer to fill it.
+            //
+            // This is the only place the real pixel size arrives, so it is the only place the
+            // hook can go. Optional by `@hasDecl`, like `displayRealized` above: Metal and
+            // OpenGL declare no such method and are unchanged.
+            //
+            // Under the draw mutex, which matters more than it looks: `ResizeBuffers` fails
+            // outright while any back-buffer reference is outstanding, and the frame loop
+            // takes this same mutex around `drawFrame`.
+            if (@hasDecl(GraphicsAPI, "setSurfaceSize")) {
+                self.api.setSurfaceSize(
+                    size.screen.width,
+                    size.screen.height,
+                ) catch |err| {
+                    // Logged, not propagated. This function cannot fail -- it is called from
+                    // the renderer thread's message pump -- and a resize that did not take
+                    // leaves a stretched frame, which is a great deal better than tearing
+                    // down the surface.
+                    log.err("could not resize the surface err={}", .{err});
+                };
+            }
+
             self.updateScreenSizeUniforms();
 
             log.debug("screen size size={}", .{size});

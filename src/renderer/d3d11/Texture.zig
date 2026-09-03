@@ -174,6 +174,18 @@ pub fn deinit(self: Self) void {
     self.texture.release();
 }
 
+/// Take a reference to every interface this texture holds.
+///
+/// A `Texture` is a value type holding three raw COM pointers, so copying one copies the
+/// pointers and NOT the references -- and then two copies each call `deinit`, releasing the
+/// same interfaces twice. `retain` is what makes a copy legitimate, and it exists as the
+/// mirror of `deinit` so a reader can see they are a pair.
+pub fn retain(self: Self) void {
+    self.texture.addRef();
+    self.srv.addRef();
+    if (self.rtv) |v| v.addRef();
+}
+
 /// Replace a rectangle of the texture.
 ///
 /// The row pitch is the *source* pitch, which is the region's width and not the texture's.

@@ -44,6 +44,11 @@ pub fn deinit(self: *Self) void {
     self.texture.deinit();
 }
 
+/// See `Texture.retain`. A `Target` is a value type too, and the same rule applies to it.
+pub fn retain(self: Self) void {
+    self.texture.retain();
+}
+
 /// The view to draw into.
 pub fn view(self: Self) api.RenderTargetView {
     // A target is always created as a render target, so this is present by construction.
