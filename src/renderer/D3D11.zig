@@ -326,7 +326,25 @@ pub fn presentLastTarget(self: *D3D11) !void {
 /// Only the chain the frames are presented through. The renderer's own targets are its
 /// business, and it rebuilds them from `surfaceSize()` on the next frame.
 pub fn setSurfaceSize(self: *D3D11, width: u32, height: u32) !void {
-    try self.device.resize(width, height);
+    self.device.resize(width, height) catch |err| {
+        // `ResizeBuffers` is a documented detection point for device loss, and the caller in
+        // `setScreenSize` logs and swallows what this returns -- it has no way not to, being
+        // a `void` function on the renderer thread's message pump. So the removal is checked
+        // and reported HERE, where the device is in scope, rather than being flattened into
+        // "the resize failed" one frame later.
+        //
+        // Nothing recovers from it yet. What this buys is that the reason appears in the log
+        // once, attributed to the call that observed it, instead of the next frame's
+        // GetDeviceRemovedReason reporting a removal with no idea what triggered it.
+        const removed = self.device.device.vt().GetDeviceRemovedReason(self.device.device.ptr);
+        if (removed != api.S_OK) {
+            log.err(
+                "device removed, observed by ResizeBuffers: reason=0x{x:0>8} err={}",
+                .{ @as(u32, @bitCast(removed)), err },
+            );
+        }
+        return err;
+    };
     // The next frame must be presented even if the terminal has not changed a cell: the back
     // buffer is new and holds nothing.
     self.device.dirty = true;

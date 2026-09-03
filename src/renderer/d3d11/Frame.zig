@@ -53,15 +53,38 @@ pub inline fn renderPass(
 /// status -- they are recorded and fail later, if at all -- so the thing worth asking is
 /// whether the device is still there. `GetDeviceRemovedReason` answers exactly that, and it is
 /// the only call in the frame path that can distinguish a lost adapter from a slow one.
+///
+/// It is asked TWICE, and that is the point of this function's shape. The first version asked
+/// once, before presenting, and reported that answer -- so on the frame where the device
+/// actually goes away the sequence was: the reason is still S_OK, health is healthy, `Present`
+/// is the call that first observes the removal, its error is logged and swallowed, and
+/// `frameCompleted` is told healthy. The one frame that knows the device died reported it
+/// fine, and the error carrying the reason was thrown away.
+///
+/// That is not merely a late report. `health` is what any recovery path has to key off, so a
+/// health signal that cannot see the failure it exists to report makes recovery unreachable.
 pub fn complete(self: *const Self, sync: bool) void {
     _ = sync;
 
-    const removed = self.device.vt().GetDeviceRemovedReason(self.device.ptr);
-    const health: Health = if (removed == api.S_OK) .healthy else .unhealthy;
+    var removed = self.device.vt().GetDeviceRemovedReason(self.device.ptr);
+    var health: Health = if (removed == api.S_OK) .healthy else .unhealthy;
 
     if (health == .healthy) {
         self.renderer.api.present(self.target.*) catch |err| {
-            log.err("failed to present the render target: err={}", .{err});
+            // Ask again. A present that fails on a live device is one thing -- an occluded
+            // window, a transient -- and a present that fails because the adapter is gone is
+            // another, and only the device can tell them apart. Deciding here on the strength
+            // of the error alone would guess.
+            removed = self.device.vt().GetDeviceRemovedReason(self.device.ptr);
+            if (removed != api.S_OK) {
+                health = .unhealthy;
+                log.err(
+                    "device removed, observed by Present: reason=0x{x:0>8} err={}",
+                    .{ @as(u32, @bitCast(removed)), err },
+                );
+            } else {
+                log.err("failed to present the render target on a live device: err={}", .{err});
+            }
         };
     } else {
         log.err("device removed: 0x{x:0>8}", .{@as(u32, @bitCast(removed))});
